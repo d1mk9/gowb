@@ -214,7 +214,7 @@ func run() error {
 		return fmt.Errorf("token validation failed: %w", err)
 	}
 
-	// Выбираем период для выгрузки - последние 30 дней
+	// Основная выгрузка за 30 дней
 	dateFrom := time.Now().AddDate(0, 0, -30).Truncate(24 * time.Hour)
 	dateTo := time.Now().Truncate(24 * time.Hour)
 
@@ -223,9 +223,262 @@ func run() error {
 		return fmt.Errorf("failed to load adverts data: %w", err)
 	}
 
-	log.Printf("Выгрузка успешно завершена. Обработано %d/%d рекламных кампаний",
+	log.Printf("Основная выгрузка завершена. Обработано %d/%d рекламных кампаний",
 		result["processed"], result["total"])
+
+	// Получаем список ID кампаний за вчерашний день из CSV
+	advertIdsToUpdate, err := getYesterdayAdvertIdsFromCSV()
+	if err != nil {
+		return fmt.Errorf("failed to get yesterday advert IDs: %w", err)
+	}
+
+	if len(advertIdsToUpdate) > 0 {
+		log.Printf("Найдено %d кампаний за вчерашний день для обновления", len(advertIdsToUpdate))
+
+		// Выгрузка за вчерашний день только для найденных кампаний
+		yesterday := time.Now().AddDate(0, 0, -1).Truncate(24 * time.Hour)
+		updateResult, err := updateSpecificAdverts(advertIdsToUpdate, yesterday, yesterday.Add(24*time.Hour))
+		if err != nil {
+			return fmt.Errorf("failed to update specific adverts: %w", err)
+		}
+
+		log.Printf("Точечное обновление завершено. Обработано %d/%d кампаний, ошибок: %d",
+			updateResult["processed"], updateResult["total"], updateResult["errors"])
+	} else {
+		log.Println("Не найдено кампаний за вчерашний день для обновления")
+	}
+
 	return nil
+}
+
+func updateSpecificAdverts(advertIds []int, dateFrom, dateTo time.Time) (map[string]interface{}, error) {
+	result := map[string]interface{}{
+		"processed": 0,
+		"total":     len(advertIds),
+		"errors":    0,
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	sem := make(chan struct{}, maxConcurrentReqs) // Ограничиваем количество одновременных запросов
+
+	for _, advertId := range advertIds {
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(id int) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+
+			// Получаем статистику для конкретной кампании
+			stat, err := getAdvertStatWithRetry(Advert{AdvertId: id, Type: 0}, dateFrom, dateTo)
+			if err != nil {
+				log.Printf("Ошибка при обновлении кампании %d: %v", id, err)
+				mu.Lock()
+				result["errors"] = result["errors"].(int) + 1
+				mu.Unlock()
+				return
+			}
+
+			// Сохраняем обновленные данные
+			statsDirPath := getStatsDir()
+			csvFile := filepath.Join(statsDirPath, "stats.csv")
+			if err := updateStatsCSV(csvFile, stat); err != nil {
+				log.Printf("Ошибка при сохранении данных для кампании %d: %v", id, err)
+				return
+			}
+
+			mu.Lock()
+			result["processed"] = result["processed"].(int) + 1
+			mu.Unlock()
+		}(advertId)
+	}
+
+	wg.Wait()
+	return result, nil
+}
+
+func updateStatsCSV(filename string, stat *EnhancedAdvertStat) error {
+	// Открываем файл для чтения и записи
+	file, err := os.OpenFile(filename, os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("ошибка открытия файла: %v", err)
+	}
+	defer file.Close()
+
+	// Читаем все записи
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return fmt.Errorf("ошибка чтения CSV: %v", err)
+	}
+
+	// Создаем временный файл для записи обновленных данных
+	tmpFile := filename + ".tmp"
+	tmp, err := os.Create(tmpFile)
+	if err != nil {
+		return fmt.Errorf("ошибка создания временного файла: %v", err)
+	}
+	defer tmp.Close()
+	defer os.Remove(tmpFile) // Удаляем временный файл в случае ошибки
+
+	writer := csv.NewWriter(tmp)
+
+	// Обрабатываем заголовок
+	if len(records) == 0 {
+		return errors.New("CSV файл пустой")
+	}
+	if err := writer.Write(records[0]); err != nil {
+		return fmt.Errorf("ошибка записи заголовка: %v", err)
+	}
+
+	// Обновляем записи
+	updated := false
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+
+	for _, record := range records[1:] { // Пропускаем заголовок
+		if len(record) < 5 { // Проверяем минимальное количество полей
+			continue
+		}
+
+		recordAdvertId, err := strconv.Atoi(record[0])
+		if err != nil {
+			continue
+		}
+
+		recordDate := record[4]
+
+		// Если это запись для нашей кампании и вчерашней даты
+		if recordAdvertId == stat.AdvertId && recordDate == yesterday {
+			// Создаем обновленную запись
+			product := ProductInfo{Article: "N/A", Name: "Неизвестный товар"}
+			cleanName := cleanProductName(product.Name)
+
+			for _, day := range stat.Days {
+				if day.Date[:10] == yesterday {
+					updatedRecord := []string{
+						strconv.Itoa(stat.AdvertId),
+						strconv.Itoa(stat.Type),
+						product.Article,
+						cleanName,
+						yesterday,
+						strconv.Itoa(day.Views),
+						strconv.Itoa(day.Clicks),
+						strconv.Itoa(day.Shks),
+						fmt.Sprintf("%.2f", day.Sum),
+						fmt.Sprintf("%.2f", day.Cpc),
+						fmt.Sprintf("%.2f", day.Ctr),
+					}
+
+					if err := writer.Write(updatedRecord); err != nil {
+						return fmt.Errorf("ошибка записи обновленной строки: %v", err)
+					}
+					updated = true
+					break
+				}
+			}
+		} else {
+			// Записываем оригинальную строку
+			if err := writer.Write(record); err != nil {
+				return fmt.Errorf("ошибка записи оригинальной строки: %v", err)
+			}
+		}
+	}
+
+	// Если не нашли запись для обновления, добавляем новую
+	if !updated {
+		product := ProductInfo{Article: "N/A", Name: "Неизвестный товар"}
+		cleanName := cleanProductName(product.Name)
+
+		for _, day := range stat.Days {
+			if day.Date[:10] == yesterday {
+				newRecord := []string{
+					strconv.Itoa(stat.AdvertId),
+					strconv.Itoa(stat.Type),
+					product.Article,
+					cleanName,
+					yesterday,
+					strconv.Itoa(day.Views),
+					strconv.Itoa(day.Clicks),
+					strconv.Itoa(day.Shks),
+					fmt.Sprintf("%.2f", day.Sum),
+					fmt.Sprintf("%.2f", day.Cpc),
+					fmt.Sprintf("%.2f", day.Ctr),
+				}
+
+				if err := writer.Write(newRecord); err != nil {
+					return fmt.Errorf("ошибка записи новой строки: %v", err)
+				}
+				break
+			}
+		}
+	}
+
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return fmt.Errorf("ошибка при сбросе буфера записи: %v", err)
+	}
+
+	// Заменяем оригинальный файл обновленным
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("ошибка закрытия временного файла: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("ошибка закрытия оригинального файла: %v", err)
+	}
+	if err := os.Rename(tmpFile, filename); err != nil {
+		return fmt.Errorf("ошибка замены файла: %v", err)
+	}
+
+	return nil
+}
+
+func getYesterdayAdvertIdsFromCSV() ([]int, error) {
+	statsDirPath := getStatsDir()
+	csvFile := filepath.Join(statsDirPath, "stats.csv")
+
+	file, err := os.Open(csvFile)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка открытия CSV файла: %v", err)
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("ошибка чтения CSV: %v", err)
+	}
+
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	var advertIds []int
+	seenIds := make(map[int]bool) // Для исключения дубликатов
+
+	for i, record := range records {
+		if i == 0 {
+			continue // Пропускаем заголовок
+		}
+
+		// Проверяем, что запись содержит достаточно полей
+		if len(record) >= 5 { // ID (0), дата (4)
+			recordDate := record[4]
+			if recordDate == yesterday {
+				advertId, err := strconv.Atoi(record[0])
+				if err != nil {
+					log.Printf("Некорректный ID кампании в строке %d: %v", i, err)
+					continue
+				}
+
+				if !seenIds[advertId] {
+					advertIds = append(advertIds, advertId)
+					seenIds[advertId] = true
+				}
+			}
+		}
+	}
+
+	return advertIds, nil
 }
 
 func startHTTPServer() {
