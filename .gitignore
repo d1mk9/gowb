@@ -1,0 +1,5 @@
+# VS Code settings folder
+.vscode/
+
+# Custom folder to ignore
+adverts_stats/
